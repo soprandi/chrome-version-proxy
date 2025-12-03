@@ -9,6 +9,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"google.golang.org/api/option"
 	"google.golang.org/api/versionhistory/v1"
@@ -27,14 +29,37 @@ type ErrorResponse struct {
 	Error string `json:"error"`
 }
 
+// CacheEntry represents a cached response with expiration time
+type CacheEntry struct {
+	Response  VersionResponse
+	ExpiresAt time.Time
+}
+
+// Cache stores version responses by platform and offset
+type Cache struct {
+	mu      sync.RWMutex
+	entries map[string]CacheEntry
+}
+
+// Global cache instance
+var cache = &Cache{
+	entries: make(map[string]CacheEntry),
+}
+
+const cacheTTL = 24 * time.Hour
+
 func main() {
 	http.HandleFunc("/api/chrome/version", getChromeVersions)
+
+	// Start cache cleanup goroutine
+	go cleanupExpiredCache()
 
 	port := ":8080"
 	log.Printf("Server started on http://localhost%s", port)
 	log.Printf("Endpoint: GET /api/chrome/version?platform=win64&offset=10")
 	log.Printf("VERSION_OFFSET=%s (default: 10)", getVersionOffset())
 	log.Printf("Use ?offset=N to override VERSION_OFFSET for a single request")
+	log.Printf("Cache TTL: 24 hours")
 	log.Fatal(http.ListenAndServe(port, nil))
 }
 
@@ -67,6 +92,17 @@ func getChromeVersions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check cache first
+	cacheKey := fmt.Sprintf("%s:%d", platform, offset)
+	if cachedResponse, found := cache.Get(cacheKey); found {
+		log.Printf("Cache HIT for platform=%s, offset=%d", platform, offset)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(cachedResponse)
+		return
+	}
+
+	log.Printf("Cache MISS for platform=%s, offset=%d", platform, offset)
+
 	// Create Google API client
 	ctx := context.Background()
 	service, err := versionhistory.NewService(ctx, option.WithoutAuthentication())
@@ -85,7 +121,7 @@ func getChromeVersions(w http.ResponseWriter, r *http.Request) {
 	call = call.PageSize(1000) // Get many versions to be sure
 	call = call.OrderBy("version desc")
 
-	response, err := call.Do()
+	apiResponse, err := call.Do()
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{
@@ -94,7 +130,7 @@ func getChromeVersions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(response.Versions) == 0 {
+	if len(apiResponse.Versions) == 0 {
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(ErrorResponse{
 			Error: "No versions found",
@@ -103,7 +139,7 @@ func getChromeVersions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. The LATEST is the first version (highest major)
-	latest := response.Versions[0].Version
+	latest := apiResponse.Versions[0].Version
 	latestMajor := extractMajor(latest)
 	log.Printf("Latest version: %s (major: %d)", latest, latestMajor)
 
@@ -112,7 +148,7 @@ func getChromeVersions(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Supported major: %d (latest %d - offset %d)", supportedMajor, latestMajor, offset)
 
 	// 3. Find the first version with the supported major
-	latestAccepted := findFirstVersionWithMajor(response.Versions, supportedMajor)
+	latestAccepted := findFirstVersionWithMajor(apiResponse.Versions, supportedMajor)
 	if latestAccepted == "" {
 		log.Printf("No version found for major %d", supportedMajor)
 		latestAccepted = fmt.Sprintf("%d.0.0.0", supportedMajor)
@@ -120,14 +156,21 @@ func getChromeVersions(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Latest accepted: %s", latestAccepted)
 	}
 
-	// Return result
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(VersionResponse{
+	// Build response
+	response := VersionResponse{
 		Latest:         latest,
 		LatestAccepted: latestAccepted,
 		Channel:        "stable",
 		Platform:       platform,
-	})
+	}
+
+	// Store in cache
+	cache.Set(cacheKey, response)
+	log.Printf("Cached result for platform=%s, offset=%d (expires in 24h)", platform, offset)
+
+	// Return result
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
 }
 
 // extractMajor extracts the major number from a version (e.g.: "143.0.7499.41" -> 143)
@@ -196,4 +239,55 @@ func getOffsetFromRequest(r *http.Request) int {
 
 	// 2. Use environment variable or default
 	return getVersionOffsetInt()
+}
+
+// Get retrieves a cached entry if it exists and hasn't expired
+func (c *Cache) Get(key string) (VersionResponse, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, found := c.entries[key]
+	if !found {
+		return VersionResponse{}, false
+	}
+
+	// Check if expired
+	if time.Now().After(entry.ExpiresAt) {
+		return VersionResponse{}, false
+	}
+
+	return entry.Response, true
+}
+
+// Set stores a response in the cache with 24h expiration
+func (c *Cache) Set(key string, response VersionResponse) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.entries[key] = CacheEntry{
+		Response:  response,
+		ExpiresAt: time.Now().Add(cacheTTL),
+	}
+}
+
+// cleanupExpiredCache removes expired entries every hour
+func cleanupExpiredCache() {
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		cache.mu.Lock()
+		now := time.Now()
+		count := 0
+		for key, entry := range cache.entries {
+			if now.After(entry.ExpiresAt) {
+				delete(cache.entries, key)
+				count++
+			}
+		}
+		if count > 0 {
+			log.Printf("Cache cleanup: removed %d expired entries", count)
+		}
+		cache.mu.Unlock()
+	}
 }

@@ -1,6 +1,6 @@
 module chrome-version-service
 
-go 1.25.4
+go 1.25.0
 
 require google.golang.org/api v0.257.0
 

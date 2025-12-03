@@ -9,6 +9,8 @@ A simple Go service that exposes a REST API to retrieve the latest stable Chrome
 - 🌍 Support for multiple platforms (win, win64, mac, mac_arm64, linux)
 - ⚙️ Configurable offset via environment variable or query parameter
 - 📊 Returns actual released versions (not synthetic ones)
+- ⚡ In-memory cache with 24-hour TTL to minimize API calls
+- 🔄 Automatic cache cleanup every hour
 
 ## Installation
 
@@ -82,10 +84,12 @@ curl http://localhost:8080/api/chrome/version?platform=mac&offset=15
 
 ## How It Works
 
-1. **Fetch versions**: Calls Google's Version History API to get all stable Chrome versions for the specified platform
-2. **Identify latest**: The first version in the response (highest major version)
-3. **Calculate supported major**: `latest_major - offset`
-4. **Find latest_accepted**: Searches through the version list to find the first actual version with the calculated major
+1. **Check cache**: First checks if a valid cached response exists for the platform/offset combination
+2. **Fetch versions**: If cache miss, calls Google's Version History API to get all stable Chrome versions for the specified platform
+3. **Identify latest**: The first version in the response (highest major version)
+4. **Calculate supported major**: `latest_major - offset`
+5. **Find latest_accepted**: Searches through the version list to find the first actual version with the calculated major
+6. **Cache result**: Stores the result in memory with a 24-hour expiration time
 
 ### Example Calculation
 
@@ -101,6 +105,38 @@ curl http://localhost:8080/api/chrome/version?platform=mac&offset=15
 | `VERSION_OFFSET` | Number of major versions to subtract from latest to calculate supported version | `10` |
 
 **Note**: The `offset` query parameter takes precedence over the `VERSION_OFFSET` environment variable for individual requests.
+
+## Cache Behavior
+
+The service implements an in-memory cache to reduce unnecessary calls to Google's API:
+
+- **Cache Key**: Combination of `platform` and `offset` (e.g., `win64:10`, `mac:5`)
+- **TTL**: 24 hours from the time of caching
+- **Invalidation**: Automatic cleanup runs every hour to remove expired entries
+- **Behavior**:
+  - First request for a platform/offset combination → **Cache MISS** → Calls Google API → Stores result
+  - Subsequent requests within 24 hours → **Cache HIT** → Returns cached result immediately
+  - Requests after 24 hours → **Cache MISS** → Calls Google API again → Updates cache
+
+### Cache Examples
+
+```bash
+# First request - Cache MISS
+curl http://localhost:8080/api/chrome/version?platform=win64&offset=10
+# Logs: "Cache MISS for platform=win64, offset=10"
+# Logs: "Calling Google API for platform=win64, offset=10"
+# Logs: "Cached result for platform=win64, offset=10 (expires in 24h)"
+
+# Second request within 24h - Cache HIT
+curl http://localhost:8080/api/chrome/version?platform=win64&offset=10
+# Logs: "Cache HIT for platform=win64, offset=10"
+# No Google API call made
+
+# Different offset - Cache MISS (different key)
+curl http://localhost:8080/api/chrome/version?platform=win64&offset=5
+# Logs: "Cache MISS for platform=win64, offset=5"
+# Logs: "Calling Google API for platform=win64, offset=5"
+```
 
 ## API Reference
 
