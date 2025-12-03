@@ -15,9 +15,6 @@ A simple Go service that exposes a REST API to retrieve the latest stable Chrome
 ## Installation
 
 ```bash
-# Clone or download the project
-cd "c:\repositories\check wks"
-
 # Initialize Go module (if not already done)
 go mod init chrome-version-service
 go mod tidy
