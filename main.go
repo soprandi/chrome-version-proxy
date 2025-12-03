@@ -29,6 +29,25 @@ type ErrorResponse struct {
 	Error string `json:"error"`
 }
 
+// HealthResponse represents the health check response
+type HealthResponse struct {
+	Status           string            `json:"status"`
+	Timestamp        string            `json:"timestamp"`
+	Uptime           string            `json:"uptime"`
+	GoogleAPIStatus  string            `json:"google_api_status"`
+	CacheStats       CacheStats        `json:"cache_stats"`
+	LastAPICall      string            `json:"last_api_call,omitempty"`
+	LastAPIError     string            `json:"last_api_error,omitempty"`
+}
+
+// CacheStats represents cache statistics
+type CacheStats struct {
+	TotalEntries   int    `json:"total_entries"`
+	ActiveEntries  int    `json:"active_entries"`
+	ExpiredEntries int    `json:"expired_entries"`
+	HitRate        string `json:"hit_rate,omitempty"`
+}
+
 // CacheEntry represents a cached response with expiration time
 type CacheEntry struct {
 	Response  VersionResponse
@@ -37,26 +56,38 @@ type CacheEntry struct {
 
 // Cache stores version responses by platform and offset
 type Cache struct {
-	mu      sync.RWMutex
-	entries map[string]CacheEntry
+	mu            sync.RWMutex
+	entries       map[string]CacheEntry
+	hits          int64
+	misses        int64
+	lastAPICall   time.Time
+	lastAPIError  string
+	apiHealthy    bool
 }
 
 // Global cache instance
-var cache = &Cache{
-	entries: make(map[string]CacheEntry),
-}
+var (
+	cache     = &Cache{
+		entries:    make(map[string]CacheEntry),
+		apiHealthy: true,
+	}
+	startTime = time.Now()
+)
 
 const cacheTTL = 24 * time.Hour
 
 func main() {
 	http.HandleFunc("/api/chrome/version", getChromeVersions)
+	http.HandleFunc("/health", healthCheck)
 
 	// Start cache cleanup goroutine
 	go cleanupExpiredCache()
 
 	port := ":8080"
 	log.Printf("Server started on http://localhost%s", port)
-	log.Printf("Endpoint: GET /api/chrome/version?platform=win64&offset=10")
+	log.Printf("Endpoints:")
+	log.Printf("  - GET /api/chrome/version?platform=win64&offset=10")
+	log.Printf("  - GET /health")
 	log.Printf("VERSION_OFFSET=%s (default: 10)", getVersionOffset())
 	log.Printf("Use ?offset=N to override VERSION_OFFSET for a single request")
 	log.Printf("Cache TTL: 24 hours")
@@ -95,18 +126,21 @@ func getChromeVersions(w http.ResponseWriter, r *http.Request) {
 	// Check cache first
 	cacheKey := fmt.Sprintf("%s:%d", platform, offset)
 	if cachedResponse, found := cache.Get(cacheKey); found {
+		cache.recordHit()
 		log.Printf("Cache HIT for platform=%s, offset=%d", platform, offset)
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(cachedResponse)
 		return
 	}
 
+	cache.recordMiss()
 	log.Printf("Cache MISS for platform=%s, offset=%d", platform, offset)
 
 	// Create Google API client
 	ctx := context.Background()
 	service, err := versionhistory.NewService(ctx, option.WithoutAuthentication())
 	if err != nil {
+		cache.recordAPIError(err)
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{
 			Error: fmt.Sprintf("Error creating service: %v", err),
@@ -123,12 +157,16 @@ func getChromeVersions(w http.ResponseWriter, r *http.Request) {
 
 	apiResponse, err := call.Do()
 	if err != nil {
+		cache.recordAPIError(err)
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(ErrorResponse{
 			Error: fmt.Sprintf("Error calling API: %v", err),
 		})
 		return
 	}
+
+	// Record successful API call
+	cache.recordAPISuccess()
 
 	if len(apiResponse.Versions) == 0 {
 		w.WriteHeader(http.StatusNotFound)
@@ -290,4 +328,136 @@ func cleanupExpiredCache() {
 		}
 		cache.mu.Unlock()
 	}
+}
+
+// healthCheck handles the health check endpoint
+func healthCheck(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Calculate uptime
+	uptime := time.Since(startTime)
+	uptimeStr := fmt.Sprintf("%dd %dh %dm %ds",
+		int(uptime.Hours())/24,
+		int(uptime.Hours())%24,
+		int(uptime.Minutes())%60,
+		int(uptime.Seconds())%60)
+
+	// Get cache stats
+	stats := cache.getStats()
+
+	// Determine overall status
+	status := "healthy"
+	if !cache.isAPIHealthy() {
+		status = "degraded"
+	}
+
+	// Build response
+	response := HealthResponse{
+		Status:          status,
+		Timestamp:       time.Now().Format(time.RFC3339),
+		Uptime:          uptimeStr,
+		GoogleAPIStatus: cache.getAPIStatus(),
+		CacheStats:      stats,
+	}
+
+	// Add last API call time if available
+	if !cache.lastAPICall.IsZero() {
+		response.LastAPICall = cache.lastAPICall.Format(time.RFC3339)
+	}
+
+	// Add last error if present
+	if cache.lastAPIError != "" {
+		response.LastAPIError = cache.lastAPIError
+	}
+
+	// Return appropriate status code
+	if status == "healthy" {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+
+	json.NewEncoder(w).Encode(response)
+}
+
+// recordHit increments cache hit counter
+func (c *Cache) recordHit() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.hits++
+}
+
+// recordMiss increments cache miss counter
+func (c *Cache) recordMiss() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.misses++
+}
+
+// recordAPISuccess marks the API as healthy
+func (c *Cache) recordAPISuccess() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastAPICall = time.Now()
+	c.apiHealthy = true
+	c.lastAPIError = ""
+}
+
+// recordAPIError marks the API as unhealthy
+func (c *Cache) recordAPIError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastAPICall = time.Now()
+	c.apiHealthy = false
+	c.lastAPIError = err.Error()
+}
+
+// isAPIHealthy returns the current API health status
+func (c *Cache) isAPIHealthy() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.apiHealthy
+}
+
+// getAPIStatus returns a human-readable API status
+func (c *Cache) getAPIStatus() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.apiHealthy {
+		return "healthy"
+	}
+	return "unhealthy"
+}
+
+// getStats returns cache statistics
+func (c *Cache) getStats() CacheStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	now := time.Now()
+	active := 0
+	expired := 0
+
+	for _, entry := range c.entries {
+		if now.Before(entry.ExpiresAt) {
+			active++
+		} else {
+			expired++
+		}
+	}
+
+	stats := CacheStats{
+		TotalEntries:   len(c.entries),
+		ActiveEntries:  active,
+		ExpiredEntries: expired,
+	}
+
+	// Calculate hit rate
+	total := c.hits + c.misses
+	if total > 0 {
+		hitRate := float64(c.hits) / float64(total) * 100
+		stats.HitRate = fmt.Sprintf("%.2f%%", hitRate)
+	}
+
+	return stats
 }
